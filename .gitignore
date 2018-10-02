@@ -1,0 +1,4 @@
+.stack-work/
+hs-validation.cabal
+*~
+**/.DS_Store
