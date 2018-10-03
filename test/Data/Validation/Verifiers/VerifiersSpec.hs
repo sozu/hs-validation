@@ -19,77 +19,79 @@ import Data.Aeson
 import Data.Char
 import Data.Validation
 
-$(declareCharFilter "Alphabet" "alphabet" 'isAlpha)
+data TestVerifier
 
-type Length_5_10 = String :? '[Length String 5 10]
-type Range_5_10 = Int :? '[InRange Int 5 10]
-type AlphabetString = String :? '[CharOf Alphabet]
+instance Verifier TestVerifier where
+    type VerifiableType TestVerifier = String
+    type VerifierSpec TestVerifier = [String, String, String]
+    verifierSpec _ = ("test", "abc" `ACons` "def" `ACons` "ghi" `ACons` ANil)
+    verify p v = let (a,b,c) = (,,) <-$ verifierArgs p
+                 in if v `elem` [a,b,c] then Right v else Left ()
 
-data LengthTest = LengthTest { str :: [Length_5_10] } deriving (Eq, Show)
-data RangeTest = RangeTest { int :: [Range_5_10] } deriving (Eq, Show)
-data AlphabetTest = AlphabetTest { alphabet :: [AlphabetString] } deriving (Eq, Show)
+data TestData = TestData { f1 :: String :? '[TestVerifier]
+                         , f2 :: [String :? '[TestVerifier]]
+                         , f3 :: Maybe (String :? '[TestVerifier])
+                         } deriving (Show, Eq)
 
-$(validatable [''LengthTest, ''RangeTest, ''AlphabetTest])
+$(validatable [''TestData])
 
 spec :: Spec
 spec = do
-    describe "Length" $ do
-        it "valid" $ do
-            let r = fromJSON $ object [("str", toJSON (["01234", "0123456789"] :: [String]))] :: Result LengthTest'
+    let vf = VerificationFailure (Proxy :: Proxy TestVerifier) ()
+
+    describe "Check verification method returns expected resulT" $ do
+        it "When input is valid data" $ do
+            let r = fromJSON $ object [ ("f1", "abc")
+                                      , ("f2", toJSON (["def", "ghi"] :: [String]))
+                                      , ("f3", "ghi")
+                                      ] :: Result TestData'
             case r of
-                Success r' -> map safeData . str <$> validate r' `shouldBe` Just ["01234", "0123456789"]
+                Success r' -> do
+                    let v = validate r'
+                    safeData . f1 <$> v `shouldBe` Just "abc"
+                    map safeData . f2 <$> v `shouldBe` Just ["def", "ghi"]
+                    (>>= return . safeData) . f3 <$> v `shouldBe` Just (Just "ghi")
                 Error e -> expectationFailure e
 
-        it "too short" $ do
-            let r = fromJSON $ object [("str", toJSON (["0123", "0123456789"] :: [String]))] :: Result LengthTest'
+        it "When input is valid data and no data for Maybe field" $ do
+            let r = fromJSON $ object [ ("f1", "abc")
+                                      , ("f2", toJSON (["def", "ghi"] :: [String]))
+                                      ] :: Result TestData'
+            case r of
+                Success r' -> do
+                    let v = validate r'
+                    safeData . f1 <$> v `shouldBe` Just "abc"
+                    map safeData . f2 <$> v `shouldBe` Just ["def", "ghi"]
+                    f3 <$> v `shouldBe` Just Nothing
+                Error e -> expectationFailure e
+
+        it "When input has invalid data for string scalar field" $ do
+            let r = fromJSON $ object [ ("f1", "xxx")
+                                      , ("f2", toJSON (["def", "ghi"] :: [String]))
+                                      ] :: Result TestData'
             case r of
                 Success r' -> do
                     validate r' `shouldBe` Nothing
-                    map ((return . safeData) <=< value) (fromJust $ value $ str' r') `shouldBe` [Nothing, Just "0123456789"]
+                    value (f1' r') `shouldBe` Nothing
                 Error e -> expectationFailure e
 
-        it "too long" $ do
-            let r = fromJSON $ object [("str", toJSON (["01234", "0123456789a"] :: [String]))] :: Result LengthTest'
+        it "When input has invalid data for string list field" $ do
+            let r = fromJSON $ object [ ("f1", "abc")
+                                      , ("f2", toJSON (["def", "xxx"] :: [String]))
+                                      ] :: Result TestData'
             case r of
                 Success r' -> do
                     validate r' `shouldBe` Nothing
-                    map ((return . safeData) <=< value) (fromJust $ value $ str' r') `shouldBe` [Just "01234", Nothing]
+                    value (f2' r') `shouldBe` Nothing
                 Error e -> expectationFailure e
 
-    describe "Range" $ do
-        it "valid" $ do
-            let r = fromJSON $ object [("int", toJSON ([5, 10] :: [Int]))] :: Result RangeTest'
-            case r of
-                Success r' -> map safeData . int <$> validate r' `shouldBe` Just [5, 10]
-                Error e -> expectationFailure e
-
-        it "too small" $ do
-            let r = fromJSON $ object [("int", toJSON ([4, 10] :: [Int]))] :: Result RangeTest'
+        it "When input has invalid data for Maybe string field" $ do
+            let r = fromJSON $ object [ ("f1", "abc")
+                                      , ("f2", toJSON (["def", "ghi"] :: [String]))
+                                      , ("f3", "xxx")
+                                      ] :: Result TestData'
             case r of
                 Success r' -> do
                     validate r' `shouldBe` Nothing
-                    map ((return . safeData) <=< value) (fromJust $ value $ int' r') `shouldBe` [Nothing, Just 10]
-                Error e -> expectationFailure e
-
-        it "too large" $ do
-            let r = fromJSON $ object [("int", toJSON ([5, 11] :: [Int]))] :: Result RangeTest'
-            case r of
-                Success r' -> do
-                    validate r' `shouldBe` Nothing
-                    map ((return . safeData) <=< value) (fromJust $ value $ int' r') `shouldBe` [Just 5, Nothing]
-                Error e -> expectationFailure e
-
-    describe "Alphabet" $ do
-        it "valid" $ do
-            let r = fromJSON $ object [("alphabet", toJSON (["abc", "def"] :: [String]))] :: Result AlphabetTest'
-            case r of
-                Success r' -> map safeData . alphabet <$> validate r' `shouldBe` Just ["abc", "def"]
-                Error e -> expectationFailure e
-
-        it "invalid" $ do
-            let r = fromJSON $ object [("alphabet", toJSON (["a0c", "def"] :: [String]))] :: Result AlphabetTest'
-            case r of
-                Success r' -> do
-                    validate r' `shouldBe` Nothing
-                    map ((return . safeData) <=< value) (fromJust $ value $ alphabet' r') `shouldBe` [Nothing, Just "def"]
+                    value (f3' r') `shouldBe` Nothing
                 Error e -> expectationFailure e

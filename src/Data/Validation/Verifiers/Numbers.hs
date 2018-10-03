@@ -83,7 +83,6 @@ instance ( Real t, Ord t
     verifierSpec _ = (ident, realValue @Double (Proxy :: Proxy a) `ACons` realValue @Double (Proxy :: Proxy b) `ACons` ANil)
         where
             io' = boolLitValue (Proxy :: Proxy io)
-            aincl' = boolLitValue (Proxy :: Proxy aincl)
             identA = if boolLitValue (Proxy :: Proxy aincl)
                             then if io' then ".gte" else ".lte"
                             else if io' then ".gt" else ".lt"
@@ -93,7 +92,7 @@ instance ( Real t, Ord t
             ident = if io' then "real" ++ identA ++ identB
                            else "real" ++ identA ++ identB
 
-    verify p v = if checkA && checkB then Right v else Left ()
+    verify p v = if (io' && checkA && checkB) || (not io' && (checkA || checkB)) then Right v else Left ()
         where
             v' = realToFrac v
             (min, max) = (,) <-$ verifierArgs p
@@ -154,21 +153,25 @@ makeRangeReal io aincl bincl a b = [t|
         RangeReal $(liftBool io) $(liftBool aincl) $(liftBool bincl) $(realLit $ realToFrac a) $(realLit $ realToFrac b)
     |]
 
-inside :: (Real t)
+inside :: (Real t, Show t)
        => t
        -> t
        -> Bool
        -> Bool
        -> TypeQ
-inside a b aincl bincl = makeRangeReal True aincl bincl a b
+inside a b aincl bincl
+    | a <= b    = makeRangeReal True aincl bincl a b
+    | otherwise = fail $ "First value (" ++ show a ++ ") must be smaller or equal to second value (" ++ show b ++ ") on inside verifier"
 
-outside :: (Real t)
+outside :: (Real t, Show t)
         => t
         -> t
         -> Bool
         -> Bool
         -> TypeQ
-outside a b aincl bincl = makeRangeReal False aincl bincl a b
+outside a b aincl bincl
+    | a <= b = makeRangeReal False aincl bincl a b
+    | otherwise = fail $ "First value (" ++ show a ++ ") must be smaller or equal to second value (" ++ show b ++ ") on outside verifier"
 
 -- ----------------------------------------------------------------
 -- Integral verifiers
@@ -184,7 +187,7 @@ type InRange t (min :: Nat) (max :: Nat) = Range 'True t min max
 -- | Type synonym representing "out of range" verifier.
 type OutOfRange t (min :: Nat) (max :: Nat) = Range 'False t min max
 
-instance (Integral t, BoolLitValue io, KnownNat min, KnownNat max) => Verifier (Range io t min max) where
+instance (Integral t, BoolLitValue io, KnownNat min, KnownNat max, min <= max) => Verifier (Range io t min max) where
     type VerifiableType (Range io t min max) = t
     type VerifierSpec (Range io t min max) = '[Integer, Integer]
 

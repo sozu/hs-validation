@@ -39,39 +39,49 @@ instance (KnownNat min, KnownNat max) => Verifier (Length String min max) where
             (min, max) = (,) <-$ verifierArgs p
 
     verificationFailure p path _ = "Length of " ++ showPath path True
-                                    ++ " must be larger than " ++ show min
-                                    ++ " and smaller than " ++ show max
+                                    ++ " must be between " ++ show min ++ " and " ++ show max
         where
             (min, max) = (,) <-$ verifierArgs p
 
 -- | Verifier applied to @String@ which verifies its length is longer or shorter than @len@.
-data CompLength (los :: Bool) s (len :: Nat)
+data CompLength (los :: Bool) (eq :: Bool) s (len :: Nat)
 
 -- | Type synonym for "longer than" verifier.
-type Longer s (len :: Nat) = CompLength 'True s len
+type Longer s (len :: Nat) = CompLength 'True 'False s len
+-- | Type synonym for "longer than or equal to" verifier.
+type LongerOr s (len :: Nat) = CompLength 'True 'True s len
 -- | Type synonym for "shorter than" verifier.
-type Shorter s (len :: Nat) = CompLength 'False s len
+type Shorter s (len :: Nat) = CompLength 'False 'False s len
+-- | Type synonym for "shorter than or equal to" verifier.
+type ShorterOr s (len :: Nat) = CompLength 'False 'True s len
 
-instance (KnownNat len, BoolLitValue los) => Verifier (CompLength los String len) where
-    type VerifiableType (CompLength los String len) = String
-    type VerifierSpec (CompLength los String len) = '[Integer]
+instance (KnownNat len, BoolLitValue los, BoolLitValue eq) => Verifier (CompLength los eq String len) where
+    type VerifiableType (CompLength los eq String len) = String
+    type VerifierSpec (CompLength los eq String len) = '[Integer]
 
     verifierSpec _ = (ident, natVal (Proxy :: Proxy len) `ACons` ANil)
         where
-            ident = if boolLitValue (Proxy :: Proxy los) then "str.longer" else "str.shorter"
+            eq' = boolLitValue (Proxy :: Proxy eq)
+            ident = if boolLitValue (Proxy :: Proxy los)
+                        then if eq' then "str.longerOr" else "str.longer"
+                        else if eq' then "str.shorterOr" else "str.shorter"
 
-    verify p v = if (los' && len > threshold) || (not los' && len < threshold) then Right v else Left ()
+    verify p v = if comp then Right v else Left ()
         where
             len = toInteger $ length v
             threshold = id <-$ verifierArgs p
             los' = boolLitValue (Proxy :: Proxy los)
+            eq' = boolLitValue (Proxy :: Proxy eq)
+            comp = if los' then if eq' then len >= threshold else len > threshold
+                           else if eq' then len <= threshold else len < threshold
 
     verificationFailure p path _ = "Length of " ++ showPath path True
-                                    ++ " must be " ++ if los' then "longer" else "shorter" ++ " than " ++ show threshold
+                                    ++ " must be " ++ if los' then "longer" else "shorter"
+                                    ++ if eq' then " than or equal to " else " than " ++ show threshold
         where
             threshold = id <-$ verifierArgs p
             los' = boolLitValue (Proxy :: Proxy los)
-
+            eq' = boolLitValue (Proxy :: Proxy eq)
 
 -- | Instances of this class are designed to be used with @CharOf@ verifier.
 --

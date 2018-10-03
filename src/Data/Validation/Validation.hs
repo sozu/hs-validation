@@ -43,7 +43,7 @@ import Debug.Trace
 data Pointer = RawPointer
              | IndexPointer Int
              | KeyPointer String
-             deriving (Eq)
+             deriving (Show, Eq)
 
 type PointerPath = [Pointer]
 
@@ -168,7 +168,7 @@ readErrorFormat acc ('%':cs) indexes = case readIndex [] cs of
     where
         readIndex :: [Char] -> [Char] -> Maybe (Int, Int)
         readIndex [] [] = Nothing
-        readIndex [] (c:cs) = if c `elem` "123456789" then readIndex [c] cs else Nothing
+        readIndex [] (c:cs) = if c `elem` "0123456789" then readIndex [c] cs else Nothing
         readIndex cur (c:cs)
             | c == '$'              = Just (read (reverse cur) :: Int, length cur + 1)
             | c `elem` "0123456789" = readIndex (c:cur) cs
