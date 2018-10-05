@@ -11,15 +11,20 @@
 
 module Data.Validation.Aeson where
 
+import GHC.Exts (IsList(..))
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Reader
 import Control.Monad.Except (catchError, throwError)
 import Data.Proxy
 import qualified Data.Map as M
 import qualified Data.List as L
 import qualified Data.Text as T
+import Data.String
 import Data.Aeson as J
 import qualified Data.Aeson.BetterErrors as JB
+import qualified Data.Aeson.BetterErrors.Internal as JBI
+import qualified Data.DList as DL
 import Data.Aeson.Types
 import Data.Validation.Validation
 
@@ -39,6 +44,10 @@ instance AsType [Char] where
     asType _ = JB.asString
 instance {-# OVERLAPPABLE #-} (Integral a) => AsType a where
     asType _ = JB.asIntegral
+instance AsType Float where
+    asType _ = JB.asRealFloat
+instance AsType Double where
+    asType _ = JB.asRealFloat
 instance AsType Bool where
     asType _ = JB.asBool
 instance {-# OVERLAPPABLE #-} (AsType a) => AsType [a] where
@@ -59,11 +68,11 @@ class AsField a where
 
 instance {-# OVERLAPPABLE #-} (AsType a) => AsField a where
     asField p (KeyPointer n) = JB.key (T.pack n) (asType p)
-    asField p RawPointer = asType p
+    asField p _ = asType p
 -- Without this instance, 'AsField [a]' has higher priority than '(AsType a) => AsField a'.
 instance {-# OVERLAPPING #-} AsField [Char] where
     asField p (KeyPointer n) = JB.key (T.pack n) (asType p)
-    asField p RawPointer = asType p
+    asField p _ = asType p
 instance (AsField a) => AsField (Maybe a) where
     asField _ (KeyPointer n) = JB.keyOrDefault (T.pack n)
                                                Nothing
@@ -78,9 +87,21 @@ instance {-# OVERLAPS #-} (AsField a, AllVerifiable vs a) => AsField (a :? vs) w
                     Right v' -> return $ SafeData v' (Proxy :: Proxy vs)
 
 instance {-# OVERLAPS #-} (AsField a) => AsField [a] where
-    -- FIXME index information is lost.
-    asField _ (KeyPointer n) = JB.key (T.pack n) $ JB.eachInArray
-                                                 $ asField (Proxy :: Proxy a) RawPointer
+    asField _ (KeyPointer n) = JB.key (T.pack n) $ JB.eachInArray $ eachItem
+        where
+            eachItem = do
+                JBI.ArrayIndex i <- (last . DL.toList . JBI.rdrPath) <$> ask
+                asField (Proxy :: Proxy a) (IndexPointer i)
+
+instance (IsString k, AsField v, Ord k) => AsField (M.Map k v) where
+    asField _ (KeyPointer n) = JB.key (T.pack n) $ do
+        obj <- JB.asObject
+        fromList <$> mapM conv (toList obj)
+        where
+            conv :: (T.Text, Value) -> JB.Parse ValidationError' (k, v)
+            conv (key, val) = do
+                v <- local (JBI.setValue val . JBI.appendPath (JBI.ObjectKey key)) $ asField (Proxy :: Proxy v) RawPointer
+                return (fromString $ T.unpack key, v)
 instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
     asField _ n = do
         source <- JB.asValue >>= return . toSource

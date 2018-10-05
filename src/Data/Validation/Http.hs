@@ -39,6 +39,8 @@ class AsFormField a where
 
 instance FromHttpApiData Object where
     parseUrlPiece _ = Left $ T.pack "Json object type can not be parsed by form data"
+instance FromHttpApiData (M.Map k v) where
+    parseUrlPiece _ = Left $ T.pack "Map type can not be parsed by form data"
 
 ttve' :: Either T.Text a
       -> Either ValidationError' a

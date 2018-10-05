@@ -5,6 +5,7 @@ module Data.Validation.ValidationSpec where
 import Test.Hspec
 import Data.Proxy
 import Data.Aeson.BetterErrors
+import qualified Data.Map as M
 import Data.Validation
 
 data V1 = V1 { f11 :: F String
@@ -32,6 +33,14 @@ data V3 = V3 { f31 :: F [F String]
 instance FromJSONBetterErrors V3 where
     fromJSONBetterErrors = V3 <$> asField (Proxy :: Proxy (F [F String])) (KeyPointer "f31")
                               <*> asField (Proxy :: Proxy (F [F Int])) (KeyPointer "f32")
+
+data V4 = V4 { f41 :: F (M.Map String (F String))
+             , f42 :: F (M.Map String (F Int))
+             }
+
+instance FromJSONBetterErrors V4 where
+    fromJSONBetterErrors = V4 <$> asField (Proxy :: Proxy (F (M.Map String (F String)))) (KeyPointer "f41")
+                              <*> asField (Proxy :: Proxy (F (M.Map String (F Int)))) (KeyPointer "f42")
 
 spec :: Spec
 spec = do
@@ -108,4 +117,30 @@ spec = do
                     (>>= return . map value) (value $ f31 v) `shouldBe` Just [Just "abc", Just "def"]
                     (>>= return . map value) (value $ f32 v) `shouldBe` Just [Just 12, Nothing]
                     (>>= return . map cause) (value $ f32 v) `shouldBe` Just [Nothing, Just (TypeMismatch (Proxy :: Proxy Int))]
+                Left e -> expectationFailure (show e)
+
+    let mapval f m = map (\(k, v) -> (k, f v)) (M.toList m)
+
+    describe "validation of map" $ do
+        it "valid" $ do
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V4) $ "{\
+                        \ \"f41\": {\"abc\": \"xyz\", \"def\": \"uvw\"}, \
+                        \ \"f42\": {\"ghi\": 12, \"jkl\": 34} \
+                        \ }"
+            case res of
+                Right v -> do
+                    (>>= return . mapval value) (value $ f41 v) `shouldBe` Just [("abc", Just "xyz"), ("def", Just "uvw")]
+                    (>>= return . mapval value) (value $ f42 v) `shouldBe` Just [("ghi", Just 12), ("jkl", Just 34)]
+                Left e -> expectationFailure (show e)
+
+        it "invalid integer" $ do
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V4) $ "{\
+                        \ \"f41\": {\"abc\": \"xyz\", \"def\": \"uvw\"}, \
+                        \ \"f42\": {\"ghi\": 12, \"jkl\": \"invalid\"} \
+                        \ }"
+            case res of
+                Right v -> do
+                    (>>= return . mapval value) (value $ f41 v) `shouldBe` Just [("abc", Just "xyz"), ("def", Just "uvw")]
+                    (>>= return . mapval value) (value $ f42 v) `shouldBe` Just [("ghi", Just 12), ("jkl", Nothing)]
+                    (>>= return . mapval cause) (value $ f42 v) `shouldBe` Just [("ghi", Nothing), ("jkl", Just (TypeMismatch (Proxy :: Proxy Int)))]
                 Left e -> expectationFailure (show e)
