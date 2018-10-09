@@ -108,157 +108,163 @@ validatable ns = concat <$> mapM conv ns
         conv :: Name -> Q [Dec]
         conv name = do
             TyConI (DataD _ _ tvs kind (c@(RecC cn recs):_) drvs) <- reify name
-            let fields = map (\(rn, _, rt) -> (genFieldName rn, rt)) recs
-            let vn = mkName "v"
-            let pn = mkName "p"
-            let c' = constructorOf n' c
-            dJson <- deriveBetterFromJSON n' c'
-            dForm <- deriveFromForm n' c'
-            dValidatable <- [d|
-                    instance Validatable $(conT n') where
-                        type ValidationTarget $(conT n') = $(conT name)
-                        validate $(varP vn) = $(validateFor cn vn fields)
-                        errors $(varP pn) $(varP vn) = $(errorsFor pn vn fields)
-                |]
-            dParse <- [d|
-                    instance AsType $(conT n') where
-                        asType _ = fromJSONBetterErrors
-                    instance AsFormField $(conT n') where
-                        --asFormField _ _ _ = Left $ T.pack "Nested type is not available as a form field."
-                        asFormField _ _ _ = Left $ ErrorString "Nested type is not available as a form field."
-                |]
-            return $ concat [[
-                DataD [] n' [] Nothing [constructorOf n' c] [DerivClause Nothing [(ConT ''Generic)]]
-              , dJson
-              , dForm
-              ], dValidatable, dParse]
+            declareValidatable ns name c
+
+declareValidatable :: [Name]
+                   -> Name
+                   -> Con
+                   -> Q [Dec]
+declareValidatable ns name c@(RecC cn recs) = do
+    let fields = map (\(rn, _, rt) -> (genFieldName rn, rt)) recs
+    let vn = mkName "v"
+    let pn = mkName "p"
+    let c' = constructorOf n' c
+    dJson <- deriveBetterFromJSON n' c'
+    dForm <- deriveFromForm n' c'
+    dValidatable <- [d|
+            instance Validatable $(conT n') where
+                type ValidationTarget $(conT n') = $(conT name)
+                validate $(varP vn) = $(validateFor cn vn fields)
+                errors $(varP pn) $(varP vn) = $(errorsFor pn vn fields)
+        |]
+    dParse <- [d|
+            instance AsType $(conT n') where
+                asType _ = fromJSONBetterErrors
+            instance AsFormField $(conT n') where
+                asFormField _ _ _ = Left $ ErrorString "Nested type is not available as a form field."
+        |]
+    return $ concat [[
+        DataD [] n' [] Nothing [constructorOf n' c] [DerivClause Nothing [(ConT ''Generic)]]
+        , dJson
+        , dForm
+        ], dValidatable, dParse]
+    where
+        -- Name of validatable data type.
+        n' = genTypeName name
+        -- Generates new type name.
+        genTypeName n = mkName $ nameBase n ++ "'"
+        -- Generates new field (wrapped by @F@) name.
+        genFieldName n = mkName $ nameBase n ++ "'"
+
+        -- Applies another expression with (<*>), namely, app [| x |] [| y |] == [| x <*> y |].
+        app :: Exp -> Exp -> Exp
+        app x y = InfixE (Just x) (VarE '(<*>)) (Just y)
+
+        -- Get field type of given type.
+        -- Validatable type is replaced with its @Validatable@ version (qualified with @'@).
+        fieldTypeOf :: Type -> FieldType
+        fieldTypeOf t@(ConT n)
+            | n `L.elem` ns = ValidatableScalar (ConT n) (ConT $ genTypeName n)
+            | otherwise = NormalScalar t
+        fieldTypeOf (AppT ListT t@(ConT n))
+            | n `L.elem` ns = ValidatableList (ConT n) (ConT $ genTypeName n)
+            | otherwise = NormalList t
+        fieldTypeOf t@(AppT (AppT (ConT m) k) (ConT v))
+            | nameBase m == "Map" && v `L.elem` ns = ValidatableMap k (ConT v) (ConT $ genTypeName v)
+            | nameBase m == "Map" = NormalMap k (ConT v)
+        fieldTypeOf t@(AppT (ConT m) (ConT n))
+            | nameBase m == "Maybe" && n `L.elem` ns = ValidatableMaybe (ConT n) (ConT $ genTypeName n)
+            | otherwise = NormalScalar t
+        fieldTypeOf t = NormalScalar t
+
+        -- Generates an implementation of @validate@
+        validateFor :: Name -> Name -> [(Name, Type)] -> ExpQ
+        validateFor cn vn fields = applicativeCon cn <$> (mapM (appValueExpQ vn) fields)
+
+        -- Generates an implementation of @errors@
+        errorsFor :: Name -> Name -> [(Name, Type)] -> ExpQ
+        errorsFor pn vn fields = appE (varE 'concat) (listE $ map (appCauseExpQ pn vn) fields)
+
+        -- Generates expression obtaining valid data from a field.
+        -- Normal type:              [| value                ((f1 :: A' -> F String)          (v :: A')) |]
+        -- Validatable type:         [| (value >=> validate) ((f1 :: B' -> F A')              (v :: B')) |]
+        -- List of normal type:      [| value                ((f1 :: A' -> F [F String])      (v :: A')) >>= sequence . map value |]
+        -- List of validatable type: [| value                ((f1 :: B' -> F [F A'])          (v :: B')) >>= sequence . map (value >=> validate) |]
+        -- Map of normal type:       [| value                ((f1 :: A' -> F (Map k (F Int))) (v :: A')) >>= validateMap Just |]
+        -- Map of validatable type:  [| value                ((f1 :: B' -> F (Map k (F A')))  (v :: B')) >>= validateMap validate |]
+        -- Maybe of validatable type:[| value                ((f1 :: B' -> F (Maybe A'))      (v :: B')) >>= id >>= return . validate |]
+        appValueExpQ :: Name -> (Name, Type) -> ExpQ
+        appValueExpQ vn (fn, ft) = do
+            let sigV = [| $(varE vn) :: $(conT n') |]
+            let sigF t = [| $(varE fn) :: $(conT n') -> F $(return t) |]
+            let fListT t = AppT ListT (AppT (ConT ''F) t)
+            let fMapT k v = AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v)
+            let maybeT t = AppT (ConT ''Maybe) t
+            case fieldTypeOf ft of
+                NormalScalar t        -> [| value                ($(sigF t) $(sigV)) |]
+                ValidatableScalar _ t -> [| (value >=> validate) ($(sigF t) $(sigV)) |]
+                NormalList t          -> [| value                ($(sigF $ fListT t) $(sigV)) >>= sequence . map value |]
+                ValidatableList _ t   -> [| value                ($(sigF $ fListT t) $(sigV)) >>= sequence . map (value >=> validate) |]
+                NormalMap k v         -> [| value                ($(sigF $ fMapT k v) $(sigV)) >>= validateMap Just |]
+                ValidatableMap k _ v  -> [| value                ($(sigF $ fMapT k v) $(sigV)) >>= validateMap validate |]
+                ValidatableMaybe _ t  -> [| value                ($(sigF $ maybeT t) $(sigV)) >>= id >>= return . validate |]
+
+        -- Generates expression obtaining list of errors from a field.
+        -- f = (f1 :: A' -> F a) (v :: A')
+        -- errX :: F x -> Maybe [ValidationError]
+        -- errN p (f :: F a) = (:[]) <$> (p !@) <$> (cause f)
+        -- errV p (f :: F A') = errN p f <|> errors p <$> (value f)
+        -- errI p (i, f) err = err (p ++ [IndexPointer i]) f
+        -- errK p (k, f) err = err (p ++ [KeyPointer k]) f
+        -- errNS p (f :: F [F a]) = errN p f <|> (value f >>= return . concat . catMaybes . map errNI . zip [0..])
+        -- errVS p (f :: F [F A']) = errN p f <|> (value f >>= return . concat . catMaybes . map errVI . zip [0..])
+        -- errNM p (f :: F (Map k (F a))) = errN p f <|> (value f >>= return . concat . catMaybes . map errNK . toList)
+        -- errMB p (f :: F (Maybe A')) = errN p f <|> (value f >>= id >>= return . errors p)
+        -- maybe [] id (errX f)
+        appCauseExpQ :: Name -> Name -> (Name, Type) -> ExpQ
+        appCauseExpQ pn vn (fn, ft) = do
+            let f t = [| ($(varE fn) :: $(conT n') -> F $(return t)) ($(varE vn) :: $(conT n')) |]
+            let errN = [| (\p f -> (:[]) . (p !@) <$> cause f) |]
+            let errV t = [| (\p f -> $(errN) p f <|> (errors p <$> value f)) |]
+            let errI p err = map (\(i, f) -> err (p ++ [IndexPointer i]) f) . zip [0..]
+            let fListT t = AppT ListT (AppT (ConT ''F) t)
+            let fMapT k v = AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v)
+            let path = [| $(varE pn) ++ [KeyPointer $ stripSuffix (nameBase fn)] |]
+            let errs = case fieldTypeOf ft of
+                    NormalScalar t         -> [| let f' = $(f t) in $(errN) $(path) f' |]
+                    ValidatableScalar t' t -> [| let f' = $(f t) in $(errV t') $(path) f' |]
+                    NormalList t           -> [|
+                            let f' = $(f $ fListT t)
+                            in $(errN) $(path) f' <|> (value f' >>=
+                                    return . concat . catMaybes . map (\(i, f) -> $(errN) ($(path) ++ [IndexPointer i]) f) . zip [0..]
+                                )
+                        |]
+                    ValidatableList t' t   -> [|
+                            let f' = $(f $ fListT t)
+                            in $(errN) $(path) f' <|> (value f' >>=
+                                    return . concat . catMaybes . map (\(i, f) -> $(errV t') ($(path) ++ [IndexPointer i]) f) . zip [0..]
+                                )
+                        |]
+                    NormalMap k v          -> [|
+                            let f' = $(f $ fMapT k v)
+                            in $(errN) $(path) f' <|> (value f' >>=
+                                    return . concat . catMaybes . map (\(k, f) -> $(errN) ($(path) ++ [KeyPointer k]) f) . fromMapToList'
+                                )
+                        |]
+                    ValidatableMap k v' v  -> [|
+                            let f' = $(f $ fMapT k v)
+                            in $(errN) $(path) f' <|> (value f' >>=
+                                    return . concat . catMaybes . map (\(k, f) -> $(errV v') ($(path) ++ [KeyPointer k]) f) . fromMapToList'
+                                )
+                        |]
+                    ValidatableMaybe t' t  -> let mt = AppT (ConT ''Maybe) t in [|
+                            let f' = $(f mt)
+                            in $(errN) $(path) f' <|> (value f' >>= id >>= return . errors $(path))
+                        |]
+            [| maybe [] id $(errs) |]
+
+        -- Generates data constructor by wrapping all types of fields with @F@.
+        constructorOf :: Name -> Con -> Con
+        constructorOf cn (RecC _ recs) = RecC cn (map (\(rn, bang, ft) -> (genFieldName rn, bang, fieldType ft)) recs)
             where
-                -- Name of validatable data type.
-                n' = genTypeName name
-                -- Generates new type name.
-                genTypeName n = mkName $ nameBase n ++ "'"
-                -- Generates new field (wrapped by @F@) name.
-                genFieldName n = mkName $ nameBase n ++ "'"
-
-                -- Applies another expression with (<*>), namely, app [| x |] [| y |] == [| x <*> y |].
-                app :: Exp -> Exp -> Exp
-                app x y = InfixE (Just x) (VarE '(<*>)) (Just y)
-
-                -- Get field type of given type.
-                -- Validatable type is replaced with its @Validatable@ version (qualified with @'@).
-                fieldTypeOf :: Type -> FieldType
-                fieldTypeOf t@(ConT n)
-                    | n `L.elem` ns = ValidatableScalar (ConT n) (ConT $ genTypeName n)
-                    | otherwise = NormalScalar t
-                fieldTypeOf (AppT ListT t@(ConT n))
-                    | n `L.elem` ns = ValidatableList (ConT n) (ConT $ genTypeName n)
-                    | otherwise = NormalList t
-                fieldTypeOf t@(AppT (AppT (ConT m) k) (ConT v))
-                    | nameBase m == "Map" && v `L.elem` ns = ValidatableMap k (ConT v) (ConT $ genTypeName v)
-                    | nameBase m == "Map" = NormalMap k (ConT v)
-                fieldTypeOf t@(AppT (ConT m) (ConT n))
-                    | nameBase m == "Maybe" && n `L.elem` ns = ValidatableMaybe (ConT n) (ConT $ genTypeName n)
-                    | otherwise = NormalScalar t
-                fieldTypeOf t = NormalScalar t
-
-                -- Generates an implementation of @validate@
-                validateFor :: Name -> Name -> [(Name, Type)] -> ExpQ
-                validateFor cn vn fields = applicativeCon cn <$> (mapM (appValueExpQ vn) fields)
-
-                -- Generates an implementation of @errors@
-                errorsFor :: Name -> Name -> [(Name, Type)] -> ExpQ
-                errorsFor pn vn fields = appE (varE 'concat) (listE $ map (appCauseExpQ pn vn) fields)
-
-                -- Generates expression obtaining valid data from a field.
-                -- Normal type:              [| value                ((f1 :: A' -> F String)          (v :: A')) |]
-                -- Validatable type:         [| (value >=> validate) ((f1 :: B' -> F A')              (v :: B')) |]
-                -- List of normal type:      [| value                ((f1 :: A' -> F [F String])      (v :: A')) >>= sequence . map value |]
-                -- List of validatable type: [| value                ((f1 :: B' -> F [F A'])          (v :: B')) >>= sequence . map (value >=> validate) |]
-                -- Map of normal type:       [| value                ((f1 :: A' -> F (Map k (F Int))) (v :: A')) >>= validateMap Just |]
-                -- Map of validatable type:  [| value                ((f1 :: B' -> F (Map k (F A')))  (v :: B')) >>= validateMap validate |]
-                -- Maybe of validatable type:[| value                ((f1 :: B' -> F (Maybe A'))      (v :: B')) >>= id >>= return . validate |]
-                appValueExpQ :: Name -> (Name, Type) -> ExpQ
-                appValueExpQ vn (fn, ft) = do
-                    let sigV = [| $(varE vn) :: $(conT n') |]
-                    let sigF t = [| $(varE fn) :: $(conT n') -> F $(return t) |]
-                    let fListT t = AppT ListT (AppT (ConT ''F) t)
-                    let fMapT k v = AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v)
-                    let maybeT t = AppT (ConT ''Maybe) t
-                    case fieldTypeOf ft of
-                        NormalScalar t        -> [| value                ($(sigF t) $(sigV)) |]
-                        ValidatableScalar _ t -> [| (value >=> validate) ($(sigF t) $(sigV)) |]
-                        NormalList t          -> [| value                ($(sigF $ fListT t) $(sigV)) >>= sequence . map value |]
-                        ValidatableList _ t   -> [| value                ($(sigF $ fListT t) $(sigV)) >>= sequence . map (value >=> validate) |]
-                        NormalMap k v         -> [| value                ($(sigF $ fMapT k v) $(sigV)) >>= validateMap Just |]
-                        ValidatableMap k _ v  -> [| value                ($(sigF $ fMapT k v) $(sigV)) >>= validateMap validate |]
-                        ValidatableMaybe _ t  -> [| value                ($(sigF $ maybeT t) $(sigV)) >>= id >>= return . validate |]
-
-                -- Generates expression obtaining list of errors from a field.
-                -- f = (f1 :: A' -> F a) (v :: A')
-                -- errX :: F x -> Maybe [ValidationError]
-                -- errN p (f :: F a) = (:[]) <$> (p !@) <$> (cause f)
-                -- errV p (f :: F A') = errN p f <|> errors p <$> (value f)
-                -- errI p (i, f) err = err (p ++ [IndexPointer i]) f
-                -- errK p (k, f) err = err (p ++ [KeyPointer k]) f
-                -- errNS p (f :: F [F a]) = errN p f <|> (value f >>= return . concat . catMaybes . map errNI . zip [0..])
-                -- errVS p (f :: F [F A']) = errN p f <|> (value f >>= return . concat . catMaybes . map errVI . zip [0..])
-                -- errNM p (f :: F (Map k (F a))) = errN p f <|> (value f >>= return . concat . catMaybes . map errNK . toList)
-                -- errMB p (f :: F (Maybe A')) = errN p f <|> (value f >>= id >>= return . errors p)
-                -- maybe [] id (errX f)
-                appCauseExpQ :: Name -> Name -> (Name, Type) -> ExpQ
-                appCauseExpQ pn vn (fn, ft) = do
-                    let f t = [| ($(varE fn) :: $(conT n') -> F $(return t)) ($(varE vn) :: $(conT n')) |]
-                    let errN = [| (\p f -> (:[]) . (p !@) <$> cause f) |]
-                    let errV t = [| (\p f -> $(errN) p f <|> (errors p <$> value f)) |]
-                    let errI p err = map (\(i, f) -> err (p ++ [IndexPointer i]) f) . zip [0..]
-                    let fListT t = AppT ListT (AppT (ConT ''F) t)
-                    let fMapT k v = AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v)
-                    let path = [| $(varE pn) ++ [KeyPointer $ stripSuffix (nameBase fn)] |]
-                    let errs = case fieldTypeOf ft of
-                            NormalScalar t         -> [| let f' = $(f t) in $(errN) $(path) f' |]
-                            ValidatableScalar t' t -> [| let f' = $(f t) in $(errV t') $(path) f' |]
-                            NormalList t           -> [|
-                                    let f' = $(f $ fListT t)
-                                    in $(errN) $(path) f' <|> (value f' >>=
-                                            return . concat . catMaybes . map (\(i, f) -> $(errN) ($(path) ++ [IndexPointer i]) f) . zip [0..]
-                                        )
-                                |]
-                            ValidatableList t' t   -> [|
-                                    let f' = $(f $ fListT t)
-                                    in $(errN) $(path) f' <|> (value f' >>=
-                                            return . concat . catMaybes . map (\(i, f) -> $(errV t') ($(path) ++ [IndexPointer i]) f) . zip [0..]
-                                        )
-                                |]
-                            NormalMap k v          -> [|
-                                    let f' = $(f $ fMapT k v)
-                                    in $(errN) $(path) f' <|> (value f' >>=
-                                            return . concat . catMaybes . map (\(k, f) -> $(errN) ($(path) ++ [KeyPointer k]) f) . fromMapToList'
-                                        )
-                                |]
-                            ValidatableMap k v' v  -> [|
-                                    let f' = $(f $ fMapT k v)
-                                    in $(errN) $(path) f' <|> (value f' >>=
-                                            return . concat . catMaybes . map (\(k, f) -> $(errV v') ($(path) ++ [KeyPointer k]) f) . fromMapToList'
-                                        )
-                                |]
-                            ValidatableMaybe t' t  -> let mt = AppT (ConT ''Maybe) t in [|
-                                    let f' = $(f mt)
-                                    in $(errN) $(path) f' <|> (value f' >>= id >>= return . errors $(path))
-                                |]
-                    [| maybe [] id $(errs) |]
-
-                -- Generates data constructor by wrapping all types of fields with @F@.
-                constructorOf :: Name -> Con -> Con
-                constructorOf cn (RecC _ recs) = RecC cn (map (\(rn, bang, ft) -> (genFieldName rn, bang, fieldType ft)) recs)
-                    where
-                        fieldType t = case fieldTypeOf t of
-                                        NormalScalar t        -> AppT (ConT ''F) t
-                                        ValidatableScalar _ t -> AppT (ConT ''F) t
-                                        NormalList t          -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
-                                        ValidatableList _ t   -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
-                                        NormalMap k v         -> AppT (ConT ''F) (AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v))
-                                        ValidatableMap k _ v  -> AppT (ConT ''F) (AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v))
-                                        ValidatableMaybe _ t  -> AppT (ConT ''F) (AppT (ConT ''Maybe) t)
+                fieldType t = case fieldTypeOf t of
+                                NormalScalar t        -> AppT (ConT ''F) t
+                                ValidatableScalar _ t -> AppT (ConT ''F) t
+                                NormalList t          -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
+                                ValidatableList _ t   -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
+                                NormalMap k v         -> AppT (ConT ''F) (AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v))
+                                ValidatableMap k _ v  -> AppT (ConT ''F) (AppT (AppT (ConT ''M.Map) k) (AppT (ConT ''F) v))
+                                ValidatableMaybe _ t  -> AppT (ConT ''F) (AppT (ConT ''Maybe) t)
 
 --jsonOptions = defaultOptions { J.fieldLabelModifier = stripSuffix, J.omitNothingFields = True }
 --formOptions = defaultFormOptions { F.fieldLabelModifier = stripSuffix }
