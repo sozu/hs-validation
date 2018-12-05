@@ -33,18 +33,16 @@ errorFormats = M.fromList [
 
 main :: IO ()
 main = do
-    let res = fromJSON $ object [ ("int1", Number 4)
-                                , ("int2", Number 5)
-                                , ("str1", J.String "abedef")
-                                , ("str2", J.String "abede")
-                                ] :: Result Values'
+    let (Success v') = fromJSON $ object [ ("int1", Number 4)
+                                         , ("int2", Number 3)
+                                         , ("str1", J.String "abedef")
+                                         , ("str2", J.String "abedefg")
+                                         ] :: Result Values'
 
-    case res of
-        Success obj -> do
-            forM_ (errorsOf obj) $ \e -> do
+    case validate v' of
+        Just v -> do
+            let result = (int1 .! v, int2 .! v, str1 .! v, str2 .! v) :: (Integer, Integer, String, String)
+            print result
+        Nothing -> do
+            forM_ (errorsOf v') $ \e -> do
                 print $ formatError errorFormats (const Nothing) e
-            print $ value $ int1' obj
-            print $ value $ int2' obj
-            print $ value $ str1' obj
-            print $ value $ str2' obj
-        Error e -> print e
